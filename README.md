@@ -52,6 +52,31 @@ curl -I https://example.test/healthcheck
 
 Without a listener, `GET` returns `200 OK` with the `OK` body and a `text/plain` content type. `HEAD` returns the same status and headers without a response body.
 
+## Set the path
+
+Set `HEALTHCHECK_PATH` in your application's `.env` file or process environment before the route cache is built:
+
+```dotenv
+HEALTHCHECK_PATH=/internal/healthcheck
+```
+
+The route keeps the `monsieurbiz_healthcheck` name and `GET`/`HEAD` methods. It does not add a response header.
+
+```bash
+curl -i https://example.test/internal/healthcheck
+curl -I https://example.test/internal/healthcheck
+```
+
+The route loader reads `$_ENV`, then `$_SERVER`, then `getenv()`. An absent, empty, or non-string value uses `/healthcheck`; a higher-priority blank value therefore does not fall through to a lower-priority source. This native read happens while PHP routes load because Symfony does not accept `%env()%` in a route path.
+
+The route path is fixed when routes are loaded and cached. After changing the variable, rebuild the application cache in the same environment:
+
+```bash
+APP_ENV=prod APP_DEBUG=0 php bin/console cache:clear
+```
+
+`cache:clear` warms Symfony's cache unless it receives `--no-warmup`; if your deployment uses that option, run `APP_ENV=prod APP_DEBUG=0 php bin/console cache:warmup` afterwards. If the application uses `composer dump-env` or `.env.local.php`, regenerate its environment dump too. The bundle does not require Flex.
+
 ## Add checks
 
 Listen to `MonsieurBiz\HealthcheckBundle\Event\HealthcheckEvent`. The event holds a mutable `Symfony\Component\HttpFoundation\Response`; a listener can change it or replace it. Register an explicit listener tag when you need a portable Symfony 6–8 configuration:
@@ -96,5 +121,3 @@ composer install
 composer validate
 composer test
 ```
-
-The committed suite currently has 8 tests and 36 assertions. It was run locally with PHP 8.5.1 and Symfony 8.1.8. The Composer constraints declare Symfony 6–8 compatibility; this does not claim that every supported combination was executed locally.

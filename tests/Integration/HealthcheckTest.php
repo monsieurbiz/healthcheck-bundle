@@ -23,12 +23,35 @@ final class HealthcheckTest extends TestCase
 {
     private ?HealthcheckTestKernel $kernel = null;
     private mixed $exceptionHandler = null;
+    private array $pathSources = [];
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        $this->pathSources = [
+            'env' => array_intersect_key($_ENV, ['HEALTHCHECK_PATH' => true]),
+            'server' => array_intersect_key($_SERVER, ['HEALTHCHECK_PATH' => true]),
+            'process' => getenv('HEALTHCHECK_PATH'),
+        ];
+        $this->exceptionHandler = set_exception_handler(null);
+        restore_exception_handler();
+        $this->configurePathSources();
+    }
 
     protected function tearDown(): void
     {
-        if (null !== $this->kernel) {
-            $this->kernel->shutdown();
+        try {
+            if (null !== $this->kernel) {
+                $this->kernel->shutdown();
+            }
+        } finally {
             $this->kernel = null;
+            unset($_ENV['HEALTHCHECK_PATH'], $_SERVER['HEALTHCHECK_PATH']);
+            $_ENV += $this->pathSources['env'];
+            $_SERVER += $this->pathSources['server'];
+            $processPath = $this->pathSources['process'];
+            putenv(false === $processPath ? 'HEALTHCHECK_PATH' : 'HEALTHCHECK_PATH='.$processPath);
 
             // Older FrameworkBundle versions install a global handler; preserve PHPUnit's handler.
             $registeredHandler = set_exception_handler(null);
@@ -36,9 +59,9 @@ final class HealthcheckTest extends TestCase
             if ($registeredHandler !== $this->exceptionHandler) {
                 restore_exception_handler();
             }
-        }
 
-        parent::tearDown();
+            parent::tearDown();
+        }
     }
 
     public function testImportedRouteUsesThePublicControllerAndAcceptsOnlyGetAndHead(): void
@@ -114,11 +137,108 @@ final class HealthcheckTest extends TestCase
         self::assertSame(404, $kernel->handle(Request::create('/healthcheck'))->getStatusCode());
     }
 
+    public function testPathFromDotenvGlobalsWorksWithoutGetenv(): void
+    {
+        $this->configurePathSources('/health-from-dotenv', '/health-from-dotenv');
+        self::assertFalse(getenv('HEALTHCHECK_PATH'));
+
+        $this->assertCustomPath('/health-from-dotenv');
+    }
+
+    public function testPathFromEnvTakesPriorityOverServerAndGetenv(): void
+    {
+        $this->configurePathSources('/health-from-env', '/health-from-server', '/health-from-process');
+
+        $this->assertCustomPath('/health-from-env');
+    }
+
+    public function testPathFromServerTakesPriorityOverGetenv(): void
+    {
+        $this->configurePathSources(null, '/health-from-server', '/health-from-process');
+
+        $this->assertCustomPath('/health-from-server');
+    }
+
+    public function testPathFromGetenvIsUsedWhenSuperglobalsAreAbsent(): void
+    {
+        $this->configurePathSources(null, null, '/health-from-process');
+
+        $this->assertCustomPath('/health-from-process');
+    }
+
+    public function testPathFallsBackToDefaultWhenAbsentOrBlank(): void
+    {
+        foreach ([
+            'all absent' => [null, null, null],
+            'blank ENV' => ['', null, null],
+            'blank SERVER' => [null, '', null],
+            'blank getenv' => [null, null, ''],
+            'blank ENV takes priority' => ['', '/health-from-server', '/health-from-process'],
+            'blank SERVER takes priority' => [null, '', '/health-from-process'],
+        ] as $case => [$env, $server, $process]) {
+            $this->configurePathSources($env, $server, $process);
+            $kernel = $this->bootKernel();
+
+            self::assertSame('/healthcheck', $kernel->getContainer()->get('router')->generate('monsieurbiz_healthcheck'), $case);
+            $response = $kernel->handle(Request::create('/healthcheck'));
+            self::assertSame(200, $response->getStatusCode(), $case);
+            self::assertSame('OK', $response->getContent(), $case);
+        }
+    }
+
+    public function testPathFallsBackToDefaultWhenHigherPrioritySourceIsNull(): void
+    {
+        $paths = [];
+        foreach (['ENV', 'SERVER'] as $source) {
+            $this->configurePathSources(null, '/health-from-server', '/health-from-process');
+            if ('ENV' === $source) {
+                $_ENV['HEALTHCHECK_PATH'] = null;
+            } else {
+                $_SERVER['HEALTHCHECK_PATH'] = null;
+            }
+            $kernel = $this->bootKernel();
+            $paths[$source] = $kernel->getContainer()->get('router')->generate('monsieurbiz_healthcheck');
+        }
+
+        self::assertSame(['ENV' => '/healthcheck', 'SERVER' => '/healthcheck'], $paths);
+    }
+
+    private function configurePathSources(?string $env = null, ?string $server = null, ?string $process = null): void
+    {
+        unset($_ENV['HEALTHCHECK_PATH'], $_SERVER['HEALTHCHECK_PATH']);
+        if (null !== $env) {
+            $_ENV['HEALTHCHECK_PATH'] = $env;
+        }
+        if (null !== $server) {
+            $_SERVER['HEALTHCHECK_PATH'] = $server;
+        }
+        putenv(null === $process ? 'HEALTHCHECK_PATH' : 'HEALTHCHECK_PATH='.$process);
+    }
+
+    private function assertCustomPath(string $path): void
+    {
+        $kernel = $this->bootKernel();
+        self::assertSame($path, $kernel->getContainer()->get('router')->generate('monsieurbiz_healthcheck'));
+
+        $request = Request::create($path, 'GET');
+        $response = $kernel->handle($request);
+        self::assertSame('monsieurbiz_healthcheck', $request->attributes->get('_route'));
+        self::assertSame(200, $response->getStatusCode());
+        self::assertSame('OK', $response->getContent());
+
+        $response = $kernel->handle(Request::create($path, 'HEAD'));
+        self::assertSame(200, $response->getStatusCode());
+        self::assertSame('', $response->getContent());
+        self::assertSame(404, $kernel->handle(Request::create('/healthcheck'))->getStatusCode());
+        self::assertSame(405, $kernel->handle(Request::create($path, 'POST'))->getStatusCode());
+    }
+
     private function bootKernel(bool $importRoutes = true): HealthcheckTestKernel
     {
+        if (null !== $this->kernel) {
+            $this->kernel->shutdown();
+        }
         $this->kernel = new HealthcheckTestKernel($importRoutes ? 'test' : 'test_without_routes', false);
-        $this->exceptionHandler = set_exception_handler(null);
-        restore_exception_handler();
         $this->kernel->boot();
 
         return $this->kernel;
@@ -128,6 +248,14 @@ final class HealthcheckTest extends TestCase
 final class HealthcheckTestKernel extends Kernel
 {
     use MicroKernelTrait;
+
+    private string $testCacheId;
+
+    public function __construct(string $environment, bool $debug)
+    {
+        $this->testCacheId = bin2hex(random_bytes(8));
+        parent::__construct($environment, $debug);
+    }
 
     public function registerBundles(): iterable
     {
@@ -141,7 +269,7 @@ final class HealthcheckTestKernel extends Kernel
 
     public function getCacheDir(): string
     {
-        return $this->getProjectDir().'/var/cache/'.$this->getEnvironment();
+        return $this->getProjectDir().'/var/cache/'.$this->getEnvironment().'/'.$this->testCacheId;
     }
 
     public function getBuildDir(): string

@@ -13,6 +13,8 @@ Keep this bundle a minimal liveness endpoint. Add behavior only when the endpoin
 - `HealthcheckEvent` owns a mutable `Response`; listeners may mutate or replace it.
 - Do not catch listener exceptions in the controller. They must reach Symfony's standard exception flow.
 - Routes are opt-in. Consumers import `config/routes.php` explicitly.
+- `HEALTHCHECK_PATH` is read during PHP route loading from `$_ENV`, then `$_SERVER`, then `getenv()`; absent, empty, or non-string values use `/healthcheck`.
+- Tests that change `HEALTHCHECK_PATH` must restore all three sources and use a unique route-cache directory.
 
 ## Layout
 
