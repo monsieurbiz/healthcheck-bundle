@@ -1,0 +1,63 @@
+name: Tests
+
+on:
+    push:
+    pull_request:
+
+permissions:
+    contents: read
+
+jobs:
+    tests:
+        name: PHP ${{ matrix.php }} / Symfony ${{ matrix.symfony }}
+        runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    # PHP 8.0 runs the latest patch; resolution checks the exact package minimum.
+                    - { php: '8.0', platform: '8.0.2', symfony: '6.0.*' }
+                    - { php: '8.1', platform: '8.1.0', symfony: '6.4.*' }
+                    - { php: '8.2', platform: '8.2.0', symfony: '7.0.*' }
+                    - { php: '8.2', platform: '8.2.0', symfony: '7.4.*' }
+                    - { php: '8.4', platform: '8.4.1', symfony: '8.1.*' }
+                    - { php: '8.5', platform: '8.5.0', symfony: '8.*' }
+        env:
+            COMPOSER_HOME: ${{ github.workspace }}/var/composer/home
+            COMPOSER_CACHE_DIR: ${{ github.workspace }}/var/composer/cache
+            SYMFONY: ${{ matrix.symfony }}
+        steps:
+            - uses: actions/checkout@v5
+              with:
+                  persist-credentials: false
+            - uses: shivammathur/setup-php@v2
+              with:
+                  php-version: ${{ matrix.php }}
+                  extensions: mbstring, xml
+                  coverage: none
+                  tools: composer:2.10
+            - name: Resolve and install the selected Symfony branch
+              shell: bash
+              run: |
+                  mkdir -p var/tmp
+                  export TMPDIR="$PWD/var/tmp"
+                  composer validate --strict
+                  composer config platform.php '${{ matrix.platform }}'
+                  if [[ "$SYMFONY" == '6.0.*' || "$SYMFONY" == '7.0.*' ]]; then
+                      # Only these EOL package versions bypass advisory blocking; audit still reports them.
+                      composer config --json policy.advisories.ignore "$(php -r '
+                          $ignore = [];
+                          foreach (["symfony/cache", "symfony/http-foundation", "symfony/routing"] as $package) {
+                              $ignore[$package] = ["constraint" => getenv("SYMFONY"), "on-audit" => false, "reason" => "EOL compatibility test only; not for deployments"];
+                          }
+                          echo json_encode($ignore);
+                      ')"
+                  fi
+                  # Contracts and polyfills have their own version lines; pin all release-train dependencies.
+                  constraints=()
+                  for component in cache config dependency-injection error-handler event-dispatcher filesystem finder framework-bundle http-foundation http-kernel routing var-dumper var-exporter; do
+                      constraints+=(--with "symfony/$component:$SYMFONY")
+                  done
+                  composer update "${constraints[@]}" --with-all-dependencies --no-install --no-interaction --prefer-dist --no-progress
+                  composer install --no-interaction --prefer-dist --no-progress
+            - run: composer test -- --fail-on-risky

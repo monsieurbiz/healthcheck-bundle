@@ -22,12 +22,20 @@ use Symfony\Component\Routing\Loader\Configurator\RoutingConfigurator;
 final class HealthcheckTest extends TestCase
 {
     private ?HealthcheckTestKernel $kernel = null;
+    private mixed $exceptionHandler = null;
 
     protected function tearDown(): void
     {
         if (null !== $this->kernel) {
             $this->kernel->shutdown();
             $this->kernel = null;
+
+            // Older FrameworkBundle versions install a global handler; preserve PHPUnit's handler.
+            $registeredHandler = set_exception_handler(null);
+            restore_exception_handler();
+            if ($registeredHandler !== $this->exceptionHandler) {
+                restore_exception_handler();
+            }
         }
 
         parent::tearDown();
@@ -109,6 +117,8 @@ final class HealthcheckTest extends TestCase
     private function bootKernel(bool $importRoutes = true): HealthcheckTestKernel
     {
         $this->kernel = new HealthcheckTestKernel($importRoutes ? 'test' : 'test_without_routes', false);
+        $this->exceptionHandler = set_exception_handler(null);
+        restore_exception_handler();
         $this->kernel->boot();
 
         return $this->kernel;
@@ -156,7 +166,7 @@ final class HealthcheckTestKernel extends Kernel
     protected function configureRoutes(RoutingConfigurator $routes): void
     {
         if ('test' === $this->getEnvironment()) {
-            $routes->import($this->getProjectDir().'/config/routes.php');
+            $routes->import('@MonsieurBizHealthcheckBundle/config/routes.php');
         }
     }
 }
