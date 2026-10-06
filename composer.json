@@ -1,12 +1,12 @@
 {
     "name": "monsieurbiz/healthcheck-bundle",
-    "description": "Symfony bundle providing a /healthcheck endpoint that dispatches a HealthcheckEvent.",
+    "description": "Symfony bundle providing a /healthcheck endpoint running tagged DoCheckInterface checks.",
     "type": "symfony-bundle",
     "license": "MIT",
     "require": {
         "php": ">=8.0.2",
+        "psr/log": "^1.1 || ^2.0 || ^3.0",
         "symfony/dependency-injection": "^6.0 || ^7.0 || ^8.0",
-        "symfony/event-dispatcher-contracts": "^2.5 || ^3.0",
         "symfony/http-foundation": "^6.0 || ^7.0 || ^8.0",
         "symfony/http-kernel": "^6.0 || ^7.0 || ^8.0",
         "symfony/routing": "^6.0 || ^7.0 || ^8.0"

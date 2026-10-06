@@ -5,19 +5,24 @@ declare(strict_types=1);
 namespace MonsieurBiz\HealthcheckBundle\Tests\Integration;
 
 use MonsieurBiz\HealthcheckBundle\Controller\HealthcheckController;
-use MonsieurBiz\HealthcheckBundle\Event\HealthcheckEvent;
 use MonsieurBiz\HealthcheckBundle\MonsieurBizHealthcheckBundle;
+use MonsieurBiz\HealthcheckBundle\Tests\Fixture\RecordingLogger;
+use MonsieurBiz\HealthcheckBundle\Tests\Fixture\TestCheck;
 use PHPUnit\Framework\TestCase;
+use Psr\Log\LoggerInterface;
+use Psr\Log\LogLevel;
 use Symfony\Bundle\FrameworkBundle\FrameworkBundle;
 use Symfony\Bundle\FrameworkBundle\Kernel\MicroKernelTrait;
 use Symfony\Component\DependencyInjection\Loader\Configurator\ContainerConfigurator;
 use Symfony\Component\HttpFoundation\Request;
-use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Event\ExceptionEvent;
+use Symfony\Component\HttpKernel\Exception\HttpException;
 use Symfony\Component\HttpKernel\Exception\ServiceUnavailableHttpException;
 use Symfony\Component\HttpKernel\Kernel;
 use Symfony\Component\HttpKernel\KernelEvents;
 use Symfony\Component\Routing\Loader\Configurator\RoutingConfigurator;
+
+use function Symfony\Component\DependencyInjection\Loader\Configurator\service;
 
 final class HealthcheckTest extends TestCase
 {
@@ -70,6 +75,7 @@ final class HealthcheckTest extends TestCase
         $container = $kernel->getContainer();
 
         self::assertInstanceOf(HealthcheckController::class, $container->get(HealthcheckController::class));
+        self::assertInstanceOf(LoggerInterface::class, $container->get('test.framework_logger'));
         self::assertSame('/healthcheck', $container->get('router')->generate('monsieurbiz_healthcheck'));
 
         $request = Request::create('/healthcheck', 'GET');
@@ -90,43 +96,81 @@ final class HealthcheckTest extends TestCase
         }
     }
 
-    public function testControllerUsesTheApplicationEventDispatcher(): void
+    public function testAutoconfiguredAndExplicitlyTaggedPrivateChecksAreInvoked(): void
     {
-        $kernel = $this->bootKernel();
-        $replacement = new Response('Dependency unavailable', 503, ['Content-Type' => 'text/plain']);
-        $kernel->getContainer()->get('event_dispatcher')->addListener(
-            HealthcheckEvent::class,
-            static function (HealthcheckEvent $event) use ($replacement): void {
-                $event->setResponse($replacement);
-            }
-        );
+        $kernel = $this->bootKernel(true, 'healthy');
+        $container = $kernel->getContainer();
 
         $response = $kernel->handle(Request::create('/healthcheck'));
 
-        self::assertSame($replacement, $response);
-        self::assertSame(503, $response->getStatusCode());
-        self::assertSame('Dependency unavailable', $response->getContent());
+        self::assertSame(200, $response->getStatusCode());
+        self::assertSame('OK', $response->getContent());
+        $checks = $container->get('test.checks');
+        self::assertSame([1, 1, 1], [$checks['automatic']->calls, $checks['tagged']->calls, $checks['last']->calls]);
+        foreach ([AutomaticCheck::class, TaggedCheck::class, LastCheck::class] as $id) {
+            self::assertFalse($container->has($id), 'Checks must work without being public.');
+        }
+        self::assertSame([], $this->checkLogRecords($container->get('logger')));
     }
 
-    public function testListenerExceptionReachesKernelExceptionAndSymfonyHandlesIt(): void
+    public function testFalseCheckLogsFailureAndStopsLowerPriorityChecks(): void
     {
-        $kernel = $this->bootKernel();
-        $dispatcher = $kernel->getContainer()->get('event_dispatcher');
-        $failure = new ServiceUnavailableHttpException(17, 'Probe failed');
+        $kernel = $this->bootKernel(true, 'false');
+
+        $response = $kernel->handle(Request::create('/healthcheck'));
+
+        self::assertSame(503, $response->getStatusCode());
+        self::assertNotSame('OK', $response->getContent());
+        $checks = $kernel->getContainer()->get('test.checks');
+        self::assertSame([0, 1, 0], [$checks['automatic']->calls, $checks['tagged']->calls, $checks['last']->calls]);
+        $records = $this->checkLogRecords($kernel->getContainer()->get('logger'));
+        self::assertCount(1, $records);
+        self::assertSame(LogLevel::ERROR, $records[0]['level']);
+        self::assertSame(TaggedCheck::class, $records[0]['context']['check']);
+        self::assertInstanceOf(\Throwable::class, $records[0]['context']['exception']);
+        self::assertStringContainsString('TaggedCheck', $records[0]['message']);
+        $reason = $records[0]['context']['exception']->getMessage();
+        self::assertNotSame('', $reason);
+        self::assertTrue(strpos($records[0]['message'], $reason) !== false || stripos($records[0]['message'], 'false') !== false);
+    }
+
+    public function testUnexpectedThrowablesReachKernelExceptionAsGeneric503WithoutExposingDetails(): void
+    {
+        foreach (['runtime', 'error'] as $mode) {
+            $kernel = $this->bootKernel(true, $mode);
+            $original = $kernel->getContainer()->get('test.checks')['failure'];
+            $caught = null;
+            $kernel->getContainer()->get('event_dispatcher')->addListener(KernelEvents::EXCEPTION, static function (ExceptionEvent $event) use (&$caught): void {
+                $caught = $event->getThrowable();
+            }, 512);
+
+            $response = $kernel->handle(Request::create('/healthcheck'));
+
+            self::assertSame(503, $response->getStatusCode());
+            self::assertInstanceOf(ServiceUnavailableHttpException::class, $caught);
+            self::assertSame($original, $caught->getPrevious());
+            self::assertStringNotContainsString($original->getMessage(), $response->getContent());
+            self::assertNotSame('OK', $response->getContent());
+            $this->assertOriginalFailureWasLogged($kernel, $original);
+        }
+    }
+
+    public function testCustomHttpExceptionIsUnchangedInKernelExceptionAndKeepsStatusAndHeaders(): void
+    {
+        $kernel = $this->bootKernel(true, 'http');
+        $original = $kernel->getContainer()->get('test.checks')['failure'];
         $caught = null;
-        $dispatcher->addListener(HealthcheckEvent::class, static function () use ($failure): void {
-            throw $failure;
-        });
-        $dispatcher->addListener(KernelEvents::EXCEPTION, static function (ExceptionEvent $event) use (&$caught): void {
+        $kernel->getContainer()->get('event_dispatcher')->addListener(KernelEvents::EXCEPTION, static function (ExceptionEvent $event) use (&$caught): void {
             $caught = $event->getThrowable();
         }, 512);
 
         $response = $kernel->handle(Request::create('/healthcheck'));
 
-        self::assertSame($failure, $caught);
-        self::assertSame(503, $response->getStatusCode());
+        self::assertSame($original, $caught);
+        self::assertSame(429, $response->getStatusCode());
         self::assertSame('17', $response->headers->get('Retry-After'));
-        self::assertNotSame('OK', $response->getContent());
+        self::assertSame('quota', $response->headers->get('X-Probe'));
+        $this->assertOriginalFailureWasLogged($kernel, $original);
     }
 
     public function testBundleDoesNotExposeTheRouteWithoutAnApplicationImport(): void
@@ -233,12 +277,32 @@ final class HealthcheckTest extends TestCase
         self::assertSame(405, $kernel->handle(Request::create($path, 'POST'))->getStatusCode());
     }
 
-    private function bootKernel(bool $importRoutes = true): HealthcheckTestKernel
+    private function checkLogRecords(RecordingLogger $logger): array
+    {
+        return array_values(array_filter($logger->records, static function (array $record): bool {
+            return array_key_exists('check', $record['context']);
+        }));
+    }
+
+    private function assertOriginalFailureWasLogged(HealthcheckTestKernel $kernel, \Throwable $original): void
+    {
+        $records = $this->checkLogRecords($kernel->getContainer()->get('logger'));
+        self::assertCount(1, $records);
+        self::assertSame(LogLevel::ERROR, $records[0]['level']);
+        self::assertSame(TaggedCheck::class, $records[0]['context']['check']);
+        self::assertSame($original, $records[0]['context']['exception']);
+        self::assertStringContainsString('TaggedCheck', $records[0]['message']);
+        self::assertStringContainsString($original->getMessage(), $records[0]['message']);
+        $checks = $kernel->getContainer()->get('test.checks');
+        self::assertSame([0, 1, 0], [$checks['automatic']->calls, $checks['tagged']->calls, $checks['last']->calls]);
+    }
+
+    private function bootKernel(bool $importRoutes = true, string $checkMode = 'none'): HealthcheckTestKernel
     {
         if (null !== $this->kernel) {
             $this->kernel->shutdown();
         }
-        $this->kernel = new HealthcheckTestKernel($importRoutes ? 'test' : 'test_without_routes', false);
+        $this->kernel = new HealthcheckTestKernel($importRoutes ? 'test' : 'test_without_routes', false, $checkMode);
         $this->kernel->boot();
 
         return $this->kernel;
@@ -251,7 +315,7 @@ final class HealthcheckTestKernel extends Kernel
 
     private string $testCacheId;
 
-    public function __construct(string $environment, bool $debug)
+    public function __construct(string $environment, bool $debug, private string $checkMode = 'none')
     {
         $this->testCacheId = bin2hex(random_bytes(8));
         parent::__construct($environment, $debug);
@@ -284,11 +348,42 @@ final class HealthcheckTestKernel extends Kernel
 
     protected function configureContainer(ContainerConfigurator $container): void
     {
+        // Model HTTP requests under CLI without replacing Symfony's production error renderer.
+        $container->parameters()->set('kernel.runtime_mode.web', true);
+
         $container->extension('framework', [
             'secret' => 'healthcheck-tests',
             'http_method_override' => false,
             'router' => ['utf8' => true],
         ]);
+
+        $services = $container->services();
+        $services->alias('test.framework_logger', 'logger')->public();
+        if ('none' === $this->checkMode) {
+            return;
+        }
+
+        $services->set('logger', RecordingLogger::class)->public();
+        $services->set(AutomaticCheck::class)->autoconfigure();
+        $tagged = $services->set(TaggedCheck::class)->tag('monsieurbiz.healthcheck', ['priority' => 10]);
+        $services->set(LastCheck::class)->tag('monsieurbiz.healthcheck', ['priority' => -10]);
+        $probe = [
+            'automatic' => service(AutomaticCheck::class),
+            'tagged' => service(TaggedCheck::class),
+            'last' => service(LastCheck::class),
+        ];
+        if ('false' === $this->checkMode) {
+            $tagged->args([false]);
+        } elseif ('healthy' !== $this->checkMode) {
+            if ('http' === $this->checkMode) {
+                $services->set('test.failure', HttpException::class)->args([429, 'Private probe quota details', null, ['Retry-After' => '17', 'X-Probe' => 'quota']]);
+            } else {
+                $services->set('test.failure', 'error' === $this->checkMode ? \Error::class : \RuntimeException::class)->args(['Private check failure details']);
+            }
+            $tagged->args([service('test.failure')]);
+            $probe['failure'] = service('test.failure');
+        }
+        $services->set('test.checks', \ArrayObject::class)->args([$probe])->public();
     }
 
     protected function configureRoutes(RoutingConfigurator $routes): void
@@ -297,4 +392,16 @@ final class HealthcheckTestKernel extends Kernel
             $routes->import('@MonsieurBizHealthcheckBundle/config/routes.php');
         }
     }
+}
+
+final class AutomaticCheck extends TestCheck
+{
+}
+
+final class TaggedCheck extends TestCheck
+{
+}
+
+final class LastCheck extends TestCheck
+{
 }

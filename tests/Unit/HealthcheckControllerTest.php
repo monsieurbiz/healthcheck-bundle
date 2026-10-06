@@ -5,67 +5,132 @@ declare(strict_types=1);
 namespace MonsieurBiz\HealthcheckBundle\Tests\Unit;
 
 use MonsieurBiz\HealthcheckBundle\Controller\HealthcheckController;
-use MonsieurBiz\HealthcheckBundle\Event\HealthcheckEvent;
+use MonsieurBiz\HealthcheckBundle\Tests\Fixture\RecordingLogger;
+use MonsieurBiz\HealthcheckBundle\Tests\Fixture\TestCheck;
 use PHPUnit\Framework\TestCase;
-use Symfony\Component\EventDispatcher\EventDispatcher;
-use Symfony\Component\HttpFoundation\Response;
+use Psr\Log\LogLevel;
+use Symfony\Component\HttpKernel\Exception\HttpException;
+use Symfony\Component\HttpKernel\Exception\ServiceUnavailableHttpException;
 
 final class HealthcheckControllerTest extends TestCase
 {
-    public function testInitialResponseIsDispatchedUnderTheEventClassName(): void
+    public function testEmptyCheckListReturnsPlainOkWithoutLogging(): void
     {
-        $dispatcher = new EventDispatcher();
-        $events = [];
-        $dispatcher->addListener(HealthcheckEvent::class, static function (HealthcheckEvent $event) use (&$events): void {
-            $events[] = $event;
-        });
+        $logger = new RecordingLogger();
+        $response = (new HealthcheckController([], $logger))();
 
-        $response = (new HealthcheckController($dispatcher))();
-
-        self::assertSame('OK', $response->getContent());
         self::assertSame(200, $response->getStatusCode());
+        self::assertSame('OK', $response->getContent());
         self::assertSame('text/plain', $response->headers->get('Content-Type'));
-        self::assertCount(1, $events);
-        self::assertSame($response, $events[0]->getResponse());
+        self::assertSame([], $logger->records);
     }
 
-    public function testListenerCanMutateTheInitialResponse(): void
+    public function testAllHealthyChecksAreInvokedOnceWithoutLogging(): void
     {
-        $dispatcher = new EventDispatcher();
-        $dispatcher->addListener(HealthcheckEvent::class, static function (HealthcheckEvent $event): void {
-            $event->getResponse()->setContent('{"status":"degraded"}');
-            $event->getResponse()->setStatusCode(503);
-            $event->getResponse()->headers->set('Content-Type', 'application/json');
-        });
+        $first = new TestCheck();
+        $second = new TestCheck();
+        $logger = new RecordingLogger();
+        $response = (new HealthcheckController(new \ArrayIterator([$first, $second]), $logger))();
 
-        $response = (new HealthcheckController($dispatcher))();
-
-        self::assertSame('{"status":"degraded"}', $response->getContent());
-        self::assertSame(503, $response->getStatusCode());
-        self::assertSame('application/json', $response->headers->get('Content-Type'));
+        self::assertSame(200, $response->getStatusCode());
+        self::assertSame('OK', $response->getContent());
+        self::assertSame([1, 1], [$first->calls, $second->calls]);
+        self::assertSame('text/plain', $response->headers->get('Content-Type'));
+        self::assertSame([], $logger->records);
     }
 
-    public function testListenerCanReplaceTheResponse(): void
+    public function testFalseResultLogsFailureAndStopsAfterTheHealthyCheck(): void
     {
-        $dispatcher = new EventDispatcher();
-        $replacement = new Response('Maintenance', 503, ['Retry-After' => '60']);
-        $dispatcher->addListener(HealthcheckEvent::class, static function (HealthcheckEvent $event) use ($replacement): void {
-            $event->setResponse($replacement);
-        });
+        $healthy = new TestCheck();
+        $failed = new FailedCheck(false);
+        $skipped = new TestCheck();
+        $logger = new RecordingLogger();
 
-        self::assertSame($replacement, (new HealthcheckController($dispatcher))());
+        $failure = $this->invokeFailure([$healthy, $failed, $skipped], $logger);
+
+        self::assertInstanceOf(ServiceUnavailableHttpException::class, $failure);
+        self::assertSame(503, $failure->getStatusCode());
+        self::assertArrayNotHasKey('Retry-After', $failure->getHeaders());
+        self::assertContains($failure->getMessage(), ['Healthcheck failed.', 'Check returned false.']);
+        self::assertSame([1, 1, 0], [$healthy->calls, $failed->calls, $skipped->calls]);
+        $this->assertFailureWasLogged($logger, $failed);
     }
 
-    public function testListenerExceptionIsNotCaughtByTheController(): void
+    public function testCustomHttpExceptionIsLoggedAndRethrownUnchanged(): void
     {
-        $dispatcher = new EventDispatcher();
-        $failure = new \RuntimeException('Probe failed');
-        $dispatcher->addListener(HealthcheckEvent::class, static function () use ($failure): void {
-            throw $failure;
-        });
+        $original = new HttpException(429, 'Probe quota reached', null, ['Retry-After' => '17', 'X-Probe' => 'quota']);
+        $failed = new FailedCheck($original);
+        $skipped = new TestCheck();
+        $logger = new RecordingLogger();
 
-        $this->expectExceptionObject($failure);
+        $failure = $this->invokeFailure([$failed, $skipped], $logger);
 
-        (new HealthcheckController($dispatcher))();
+        self::assertSame($original, $failure);
+        self::assertSame(429, $failure->getStatusCode());
+        self::assertSame(['Retry-After' => '17', 'X-Probe' => 'quota'], $failure->getHeaders());
+        self::assertSame([1, 0], [$failed->calls, $skipped->calls]);
+        $this->assertFailureWasLogged($logger, $failed, $original);
     }
+
+    public function testRuntimeExceptionBecomesGeneric503AndLogsTheOriginal(): void
+    {
+        $this->assertNonHttpFailure(new \RuntimeException('Private database failure details'));
+    }
+
+    public function testPhpErrorBecomesGeneric503AndLogsTheOriginal(): void
+    {
+        $this->assertNonHttpFailure(new \Error('Private PHP error details'));
+    }
+
+    private function assertNonHttpFailure(\Throwable $original): void
+    {
+        $failed = new FailedCheck($original);
+        $skipped = new TestCheck();
+        $logger = new RecordingLogger();
+
+        $failure = $this->invokeFailure([$failed, $skipped], $logger);
+
+        self::assertInstanceOf(ServiceUnavailableHttpException::class, $failure);
+        self::assertSame(503, $failure->getStatusCode());
+        self::assertSame($original, $failure->getPrevious());
+        self::assertNotSame('', $failure->getMessage());
+        self::assertStringNotContainsString($original->getMessage(), $failure->getMessage());
+        self::assertSame([1, 0], [$failed->calls, $skipped->calls]);
+        $this->assertFailureWasLogged($logger, $failed, $original);
+    }
+
+    private function invokeFailure(iterable $checks, RecordingLogger $logger): \Throwable
+    {
+        $controller = new HealthcheckController($checks, $logger);
+        try {
+            $controller();
+        } catch (\Throwable $failure) {
+            return $failure;
+        }
+
+        self::fail('An unhealthy check must throw through Symfony\'s exception flow.');
+    }
+
+    private function assertFailureWasLogged(RecordingLogger $logger, TestCheck $check, ?\Throwable $original = null): void
+    {
+        self::assertCount(1, $logger->records);
+        $record = $logger->records[0];
+        self::assertSame(LogLevel::ERROR, $record['level']);
+        self::assertSame(get_class($check), $record['context']['check']);
+        self::assertInstanceOf(\Throwable::class, $record['context']['exception']);
+        self::assertStringContainsString((new \ReflectionClass($check))->getShortName(), $record['message']);
+
+        if (null !== $original) {
+            self::assertSame($original, $record['context']['exception']);
+            self::assertStringContainsString($original->getMessage(), $record['message']);
+        } else {
+            $reason = $record['context']['exception']->getMessage();
+            self::assertNotSame('', $reason);
+            self::assertTrue(strpos($record['message'], $reason) !== false || stripos($record['message'], 'false') !== false);
+        }
+    }
+}
+
+final class FailedCheck extends TestCheck
+{
 }

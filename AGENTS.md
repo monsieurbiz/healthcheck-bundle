@@ -1,6 +1,6 @@
 # Contribution notes
 
-Keep this bundle a minimal liveness endpoint. Add behavior only when the endpoint or its event contract requires it.
+Keep this bundle a minimal endpoint for tagged application checks.
 
 ## Compatibility
 
@@ -10,15 +10,16 @@ Keep this bundle a minimal liveness endpoint. Add behavior only when the endpoin
 
 ## Invariants
 
-- `HealthcheckEvent` owns a mutable `Response`; listeners may mutate or replace it.
-- Do not catch listener exceptions in the controller. They must reach Symfony's standard exception flow.
+- `DoCheckInterface::healthcheck()` returns `bool`. Autoconfiguration applies the `monsieurbiz.healthcheck` tag only to registered services.
+- Run checks fail-fast. A `false` result and non-HTTP throwable are logged and produce a generic `503`; rethrow a logged `HttpExceptionInterface` unchanged.
 - Routes are opt-in. Consumers import `config/routes.php` explicitly.
-- `HEALTHCHECK_PATH` is read during PHP route loading from `$_ENV`, then `$_SERVER`, then `getenv()`; absent, empty, or non-string values use `/healthcheck`.
+- `HEALTHCHECK_PATH` uses the first present source during PHP route loading: `$_ENV`, then `$_SERVER`, then `getenv()`. Empty, null, and non-string values use `/healthcheck`; rebuild the route cache after changes.
 - Tests that change `HEALTHCHECK_PATH` must restore all three sources and use a unique route-cache directory.
 
 ## Layout
 
-- `src/`: bundle, controller, event, and dependency-injection extension.
+- `src/Check`: public check contract.
+- `src/`: bundle, controller, and dependency-injection extension.
 - `config/routes.php`: the `GET`/`HEAD` route definition.
 - `tests/Unit` and `tests/Integration`: PHPUnit coverage.
 

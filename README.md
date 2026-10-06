@@ -1,8 +1,8 @@
 # Healthcheck Bundle
 
-Minimal Symfony liveness endpoint with application-defined checks.
+Minimal Symfony endpoint running application-defined checks.
 
-`monsieurbiz/healthcheck-bundle` adds a `/healthcheck` route and dispatches a `MonsieurBiz\HealthcheckBundle\Event\HealthcheckEvent` for each request. With no listener, it is only a liveness probe: it does not test a database, queue, or other dependency.
+`monsieurbiz/healthcheck-bundle` adds a `/healthcheck` route that runs tagged `MonsieurBiz\HealthcheckBundle\Check\DoCheckInterface` services. It includes no checks itself.
 
 ## Requirements
 
@@ -50,7 +50,7 @@ curl -i https://example.test/healthcheck
 curl -I https://example.test/healthcheck
 ```
 
-Without a listener, `GET` returns `200 OK` with the `OK` body and a `text/plain` content type. `HEAD` returns the same status and headers without a response body.
+With no checks, or when every check returns `true`, `GET` returns `200 OK` with the `OK` body and a `text/plain` content type. `HEAD` returns the same status and headers without a response body.
 
 ## Set the path
 
@@ -79,40 +79,65 @@ APP_ENV=prod APP_DEBUG=0 php bin/console cache:clear
 
 ## Add checks
 
-Listen to `MonsieurBiz\HealthcheckBundle\Event\HealthcheckEvent`. The event holds a mutable `Symfony\Component\HttpFoundation\Response`; a listener can change it or replace it. Register an explicit listener tag when you need a portable Symfony 6–8 configuration:
+Implement `DoCheckInterface`. Each check returns `true` when healthy or `false` when unhealthy. The first `false` result returns `503` and stops lower-priority checks.
+
+```php
+<?php
+
+namespace App\Healthcheck;
+
+use MonsieurBiz\HealthcheckBundle\Check\DoCheckInterface;
+
+final class OpenSslCheck implements DoCheckInterface
+{
+    public function healthcheck(): bool
+    {
+        return \extension_loaded('openssl');
+    }
+}
+```
+
+Constructor-inject any existing application or Symfony service a check needs; no bundle-specific service API is required.
+
+Your application must register the class as a service. With the usual service discovery and autoconfiguration, the bundle adds its tag automatically:
 
 ```yaml
 # config/services.yaml
 services:
-    App\Healthcheck\DependencyHealthcheck:
+    _defaults:
+        autowire: true
+        autoconfigure: true
+
+    App\:
+        resource: '../src/'
+```
+
+Implementing the interface alone does not create a service. If discovery or autoconfiguration is unavailable, register and tag the service explicitly:
+
+```yaml
+services:
+    App\Healthcheck\OpenSslCheck:
         tags:
-            - { name: kernel.event_listener, event: MonsieurBiz\HealthcheckBundle\Event\HealthcheckEvent, method: onHealthcheck }
+            - { name: monsieurbiz.healthcheck }
 ```
 
-```php
-use MonsieurBiz\HealthcheckBundle\Event\HealthcheckEvent;
-use Symfony\Component\HttpFoundation\Response;
+Checks run in standard Symfony tag priority order; use the tag's `priority` option when order matters.
 
-public function onHealthcheck(HealthcheckEvent $event): void
-{
-    // Change the initial response.
-    $event->getResponse()->setStatusCode(503);
-    $event->getResponse()->setContent('Dependency unavailable');
+## Handle failures
 
-    // Or replace it completely.
-    $event->setResponse(new Response('Maintenance', 503, ['Content-Type' => 'text/plain']));
-}
-```
+The bundle logs every failed check at `error` level through the application's standard `logger`. The message includes the check class and reason; context includes `check` (the check FQCN) and `exception`. Configure the destination through Symfony's normal logging setup, such as `error_log` or Monolog; the bundle adds no logging package or configuration.
 
-To let Symfony handle a failed check through its normal `kernel.exception` flow, throw an HTTP exception. Do not catch it in the listener just to create a package-specific JSON response.
+An ordinary exception, including a PHP `Error`, is logged then wrapped in a generic `503` `ServiceUnavailableHttpException`, with the original throwable as its previous exception. Do not include secrets in exception messages, and restrict application-log access. Keep `APP_DEBUG=0` in production.
+
+To control the HTTP status and headers, throw a Symfony `HttpExceptionInterface` such as `ServiceUnavailableHttpException`. It is logged and rethrown unchanged, so Symfony preserves its status and headers:
 
 ```php
 use Symfony\Component\HttpKernel\Exception\ServiceUnavailableHttpException;
 
-throw new ServiceUnavailableHttpException(30, 'Dependency unavailable');
+throw new ServiceUnavailableHttpException(30, 'Custom reason');
 ```
 
-Healthcheck endpoints are often public. Do not expose credentials, dependency details, or other internal information in their response bodies. Without a listener, this endpoint remains a liveness probe only.
+Symfony's exception handling renders the message according to the application, environment, and any API error handling. This bundle provides no custom failure exception and does not promise a particular error body format. Healthcheck endpoints are often public: do not expose credentials or internal details in endpoint responses or logs.
 
 ## Test
 
