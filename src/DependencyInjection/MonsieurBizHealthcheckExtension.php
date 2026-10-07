@@ -12,14 +12,13 @@ use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Extension\Extension;
 use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\HttpKernel\KernelEvents;
-use Symfony\Component\Routing\Route;
 
 final class MonsieurBizHealthcheckExtension extends Extension
 {
     public function load(array $configs, ContainerBuilder $container): void
     {
-        // First present source wins (array_key_exists, so explicit null does not fall through);
-        // absent, empty, or non-string values use the default. Read at container compile time:
+        // First present source wins (array_key_exists, so explicit null does not fall through).
+        // Absent, empty, or non-string values use the default. Read at container compile time:
         // changing the env requires a container rebuild, it never changes the path mid-process.
         $path = \array_key_exists('HEALTHCHECK_PATH', $_ENV)
             ? $_ENV['HEALTHCHECK_PATH']
@@ -27,13 +26,20 @@ final class MonsieurBizHealthcheckExtension extends Extension
                 ? $_SERVER['HEALTHCHECK_PATH']
                 : getenv('HEALTHCHECK_PATH'));
 
-        $container->setParameter('monsieurbiz.healthcheck.path', (new Route(\is_string($path) && '' !== $path ? $path : '/healthcheck'))->getPath());
+        // Same normalization as the legacy Route::setPath(): trim whitespace, collapse
+        // leading slashes to exactly one. Interior whitespace and '+' are preserved.
+        if (!\is_string($path) || '' === $path) {
+            $path = '/healthcheck';
+        } else {
+            $path = '/'.\ltrim(\trim($path), '/');
+        }
+
+        $container->setParameter('monsieurbiz.healthcheck.path', $path);
 
         $container->registerForAutoconfiguration(DoCheckInterface::class)
             ->addTag('monsieurbiz.healthcheck');
 
         $container->register(HealthcheckController::class)
-            ->setPublic(true)
             ->addArgument(new TaggedIteratorArgument('monsieurbiz.healthcheck'))
             ->addArgument(new Reference('logger'));
 
