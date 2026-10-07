@@ -13,9 +13,11 @@ use Psr\Log\LoggerInterface;
 use Psr\Log\LogLevel;
 use Symfony\Bundle\FrameworkBundle\FrameworkBundle;
 use Symfony\Bundle\FrameworkBundle\Kernel\MicroKernelTrait;
+use Symfony\Component\DependencyInjection\ContainerInterface;
 use Symfony\Component\DependencyInjection\Loader\Configurator\ContainerConfigurator;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpKernel\Event\ExceptionEvent;
+use Symfony\Component\HttpKernel\Event\RequestEvent;
 use Symfony\Component\HttpKernel\Exception\HttpException;
 use Symfony\Component\HttpKernel\Exception\ServiceUnavailableHttpException;
 use Symfony\Component\HttpKernel\Kernel;
@@ -81,7 +83,7 @@ final class HealthcheckTest extends TestCase
         $request = Request::create('/healthcheck', 'GET');
         $response = $kernel->handle($request);
 
-        self::assertSame('monsieurbiz_healthcheck', $request->attributes->get('_route'));
+        self::assertFalse($request->attributes->has('_route'));
         self::assertSame(200, $response->getStatusCode());
         self::assertSame('OK', $response->getContent());
         self::assertStringStartsWith('text/plain', $response->headers->get('Content-Type'));
@@ -173,12 +175,127 @@ final class HealthcheckTest extends TestCase
         $this->assertOriginalFailureWasLogged($kernel, $original);
     }
 
-    public function testBundleDoesNotExposeTheRouteWithoutAnApplicationImport(): void
+    public function testBundleExposesTheEndpointWithoutImportingTheNamedRoute(): void
     {
         $kernel = $this->bootKernel(false);
 
+        foreach (['GET', 'HEAD'] as $method) {
+            $response = $kernel->handle(Request::create('/healthcheck', $method));
+            self::assertSame(200, $response->getStatusCode());
+            self::assertSame('GET' === $method ? 'OK' : '', $response->getContent());
+        }
         self::assertNull($kernel->getContainer()->get('router')->getRouteCollection()->get('monsieurbiz_healthcheck'));
-        self::assertSame(404, $kernel->handle(Request::create('/healthcheck'))->getStatusCode());
+    }
+
+    public function testEarlyHealthcheckBypassesTheApplicationRequestBlockerBeforeRouting(): void
+    {
+        $kernel = $this->bootKernel(true, 'healthy', true);
+        $blocker = $kernel->getContainer()->get(ApplicationRequestBlocker::class);
+
+        foreach (['GET', 'HEAD'] as $method) {
+            $request = Request::create('/healthcheck', $method);
+            $response = $kernel->handle($request);
+
+            self::assertSame(200, $response->getStatusCode(), $method);
+            self::assertSame('GET' === $method ? 'OK' : '', $response->getContent());
+            self::assertStringStartsWith('text/plain', $response->headers->get('Content-Type'));
+            self::assertFalse($request->attributes->has('_route'));
+        }
+        self::assertSame(0, $blocker->calls);
+        $checks = $kernel->getContainer()->get('test.checks');
+        self::assertSame([2, 2, 2], [$checks['automatic']->calls, $checks['tagged']->calls, $checks['last']->calls]);
+        // Observe at check time only: kernel.finish_request may initialize the router afterwards.
+        self::assertSame(false, $checks['router']->routerWasInitialized[0]);
+        self::assertSame([], $this->checkLogRecords($kernel->getContainer()->get('logger')));
+    }
+
+    public function testEarlyCheckFailuresKeepSymfonyExceptionHandlingWithoutRunningTheApplicationBlocker(): void
+    {
+        foreach (['false', 'runtime', 'error', 'http'] as $mode) {
+            foreach (['GET', 'HEAD'] as $method) {
+                $kernel = $this->bootKernel(false, $mode, true);
+                $blocker = $kernel->getContainer()->get(ApplicationRequestBlocker::class);
+                $caught = null;
+                $kernel->getContainer()->get('event_dispatcher')->addListener(KernelEvents::EXCEPTION, static function (ExceptionEvent $event) use (&$caught): void {
+                    $caught = $event->getThrowable();
+                }, 512);
+
+                $response = $kernel->handle(Request::create('/healthcheck', $method));
+
+                self::assertSame('http' === $mode ? 429 : 503, $response->getStatusCode(), $mode.' '.$method);
+                self::assertSame(0, $blocker->calls);
+                self::assertNotSame('OK', $response->getContent());
+                if ('HEAD' === $method) {
+                    self::assertSame('', $response->getContent());
+                }
+                $checks = $kernel->getContainer()->get('test.checks');
+                self::assertSame([false], $checks['router']->routerWasInitialized);
+                self::assertSame([0, 1, 0], [$checks['automatic']->calls, $checks['tagged']->calls, $checks['last']->calls]);
+                if ('false' === $mode) {
+                    self::assertInstanceOf(ServiceUnavailableHttpException::class, $caught);
+                    $records = $this->checkLogRecords($kernel->getContainer()->get('logger'));
+                    self::assertCount(1, $records);
+                    self::assertSame(LogLevel::ERROR, $records[0]['level']);
+                    self::assertSame(TaggedCheck::class, $records[0]['context']['check']);
+                    self::assertSame($caught, $records[0]['context']['exception']);
+                } else {
+                    $original = $checks['failure'];
+                    self::assertStringNotContainsString($original->getMessage(), $response->getContent());
+                    if ('http' === $mode) {
+                        self::assertSame($original, $caught);
+                        self::assertSame('17', $response->headers->get('Retry-After'));
+                        self::assertSame('quota', $response->headers->get('X-Probe'));
+                    } else {
+                        self::assertInstanceOf(ServiceUnavailableHttpException::class, $caught);
+                        self::assertSame($original, $caught->getPrevious());
+                    }
+                    $this->assertOriginalFailureWasLogged($kernel, $original);
+                }
+            }
+        }
+    }
+
+    public function testApplicationRequestBlockerStillRunsForOtherPathsAndMethods(): void
+    {
+        $kernel = $this->bootKernel(true, 'healthy', true);
+        $blocker = $kernel->getContainer()->get(ApplicationRequestBlocker::class);
+        $caught = null;
+        $kernel->getContainer()->get('event_dispatcher')->addListener(KernelEvents::EXCEPTION, static function (ExceptionEvent $event) use (&$caught): void {
+            $caught = $event->getThrowable();
+        }, 512);
+
+        foreach ([['GET', '/other'], ['GET', '/healthcheck/extra'], ['POST', '/healthcheck'], ['PUT', '/healthcheck']] as [$method, $path]) {
+            self::assertSame(500, $kernel->handle(Request::create($path, $method))->getStatusCode());
+            self::assertSame($blocker->failure, $caught);
+        }
+        // Error-rendering subrequests must not be mistaken for main requests.
+        self::assertSame(4, $blocker->calls);
+        $checks = $kernel->getContainer()->get('test.checks');
+        self::assertSame([0, 0, 0], [$checks['automatic']->calls, $checks['tagged']->calls, $checks['last']->calls]);
+        self::assertSame([], $checks['router']->routerWasInitialized);
+        self::assertSame([], $this->checkLogRecords($kernel->getContainer()->get('logger')));
+    }
+
+    public function testPathIsFrozenForListenerAndNamedRouteUntilTheKernelIsRebuilt(): void
+    {
+        $this->configurePathSources('///health A');
+        $kernel = $this->bootKernel(true, 'healthy');
+        // Change ENV before the first request or explicit router access.
+        $this->configurePathSources('health B');
+
+        $response = $kernel->handle(Request::create('/health%20A'));
+        self::assertSame(200, $response->getStatusCode());
+        self::assertSame('OK', $response->getContent());
+        self::assertSame(404, $kernel->handle(Request::create('/health%20B'))->getStatusCode());
+        self::assertSame('/health%20A', $kernel->getContainer()->get('router')->generate('monsieurbiz_healthcheck'));
+        self::assertSame('/health A', $kernel->getContainer()->getParameter('monsieurbiz.healthcheck.path'));
+
+        $kernel = $this->bootKernel(true, 'healthy');
+        $response = $kernel->handle(Request::create('/health%20B'));
+        self::assertSame(200, $response->getStatusCode());
+        self::assertSame('OK', $response->getContent());
+        self::assertSame('/health%20B', $kernel->getContainer()->get('router')->generate('monsieurbiz_healthcheck'));
+        self::assertSame('/health B', $kernel->getContainer()->getParameter('monsieurbiz.healthcheck.path'));
     }
 
     public function testPathFromDotenvGlobalsWorksWithoutGetenv(): void
@@ -266,7 +383,7 @@ final class HealthcheckTest extends TestCase
 
         $request = Request::create($path, 'GET');
         $response = $kernel->handle($request);
-        self::assertSame('monsieurbiz_healthcheck', $request->attributes->get('_route'));
+        self::assertFalse($request->attributes->has('_route'));
         self::assertSame(200, $response->getStatusCode());
         self::assertSame('OK', $response->getContent());
 
@@ -297,12 +414,12 @@ final class HealthcheckTest extends TestCase
         self::assertSame([0, 1, 0], [$checks['automatic']->calls, $checks['tagged']->calls, $checks['last']->calls]);
     }
 
-    private function bootKernel(bool $importRoutes = true, string $checkMode = 'none'): HealthcheckTestKernel
+    private function bootKernel(bool $importRoutes = true, string $checkMode = 'none', bool $observeRouter = false): HealthcheckTestKernel
     {
         if (null !== $this->kernel) {
             $this->kernel->shutdown();
         }
-        $this->kernel = new HealthcheckTestKernel($importRoutes ? 'test' : 'test_without_routes', false, $checkMode);
+        $this->kernel = new HealthcheckTestKernel($importRoutes ? 'test' : 'test_without_routes', false, $checkMode, $observeRouter);
         $this->kernel->boot();
 
         return $this->kernel;
@@ -315,7 +432,7 @@ final class HealthcheckTestKernel extends Kernel
 
     private string $testCacheId;
 
-    public function __construct(string $environment, bool $debug, private string $checkMode = 'none')
+    public function __construct(string $environment, bool $debug, private string $checkMode = 'none', private bool $observeRouter = false)
     {
         $this->testCacheId = bin2hex(random_bytes(8));
         parent::__construct($environment, $debug);
@@ -372,6 +489,14 @@ final class HealthcheckTestKernel extends Kernel
             'tagged' => service(TaggedCheck::class),
             'last' => service(LastCheck::class),
         ];
+        if ($this->observeRouter) {
+            $services->set(ApplicationRequestBlocker::class)->public()->tag('kernel.event_listener', [
+                'event' => KernelEvents::REQUEST,
+                'priority' => PHP_INT_MAX - 1,
+            ]);
+            $services->set(RouterObservingCheck::class)->args([service('service_container')])->tag('monsieurbiz.healthcheck', ['priority' => 20]);
+            $probe['router'] = service(RouterObservingCheck::class);
+        }
         if ('false' === $this->checkMode) {
             $tagged->args([false]);
         } elseif ('healthy' !== $this->checkMode) {
@@ -404,4 +529,40 @@ final class TaggedCheck extends TestCheck
 
 final class LastCheck extends TestCheck
 {
+}
+
+final class RouterObservingCheck extends TestCheck
+{
+    public array $routerWasInitialized = [];
+
+    public function __construct(private ContainerInterface $container)
+    {
+        parent::__construct();
+    }
+
+    public function healthcheck(): bool
+    {
+        $this->routerWasInitialized[] = $this->container->initialized('router');
+
+        return parent::healthcheck();
+    }
+}
+
+final class ApplicationRequestBlocker
+{
+    public int $calls = 0;
+    public \RuntimeException $failure;
+
+    public function __construct()
+    {
+        $this->failure = new \RuntimeException('Channel/locale request initialization failed before routing');
+    }
+
+    public function __invoke(RequestEvent $event): void
+    {
+        if ($event->isMainRequest()) {
+            ++$this->calls;
+            throw $this->failure;
+        }
+    }
 }

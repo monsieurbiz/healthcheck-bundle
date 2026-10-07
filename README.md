@@ -2,7 +2,7 @@
 
 Minimal Symfony endpoint running application-defined checks.
 
-`monsieurbiz/healthcheck-bundle` adds a `/healthcheck` route that runs tagged `MonsieurBiz\HealthcheckBundle\Check\DoCheckInterface` services. It includes no checks itself.
+`monsieurbiz/healthcheck-bundle` enables a global health endpoint that runs tagged `MonsieurBiz\HealthcheckBundle\Check\DoCheckInterface` services. It includes no checks itself.
 
 ## Requirements
 
@@ -27,7 +27,7 @@ return [
 ];
 ```
 
-This package has no Flex recipe. Import its routes explicitly, for example in `config/routes/monsieurbiz_healthcheck.php`:
+This package has no Flex recipe. The endpoint is active as soon as the bundle is registered; importing routes is optional. Import this route only when the application needs the `monsieurbiz_healthcheck` route name for URL generation or the router's `GET`/`HEAD` restriction:
 
 ```php
 <?php
@@ -37,39 +37,44 @@ declare(strict_types=1);
 use Symfony\Component\Routing\Loader\Configurator\RoutingConfigurator;
 
 return static function (RoutingConfigurator $routes): void {
+    // Optional: the listener handles the health endpoint without this import.
     $routes->import('@MonsieurBizHealthcheckBundle/config/routes.php');
 };
 ```
 
 ## Endpoint
 
-The named route is `monsieurbiz_healthcheck`. It accepts `GET` and `HEAD` only.
+The global endpoint matches `GET` and `HEAD` on the configured path before routing, security firewalls, and application `kernel.request` listeners. Its listener invokes the healthcheck controller without route attributes or router initialization. It is therefore global, not request-channel or locale scoped: no user authentication or request-context initialization occurs before checks, and checks must not depend on channel or locale context.
 
 ```bash
 curl -i https://example.test/healthcheck
 curl -I https://example.test/healthcheck
 ```
 
-With no checks, or when every check returns `true`, `GET` returns `200 OK` with the `OK` body and a `text/plain` content type. `HEAD` returns the same status and headers without a response body.
+With no checks, or when every check returns `true`, `GET` returns `200 OK` with the `OK` body and a `text/plain` content type. `HEAD` returns the same status and headers without a response body. Other paths and methods continue through the normal application; without the optional route import, this bundle does not impose a global `405` response.
+
+The listener is registered on `kernel.request` at `PHP_INT_MAX`, ahead of lower-priority request listeners. Listeners at the same priority retain Symfony's registration order. Its response stops later request dispatch, including routing, security/firewall, and application channel or locale listeners. Standard `kernel.response`, `kernel.finish_request`, and exception handling still run. Subrequests are ignored; bootstrap failures, response listeners, and non-main requests remain outside this bypass.
+
+The endpoint bypasses application request security. Keep checks fast and read-only, never expose secrets, and restrict external network access to the health URL when needed. Only this main-request listener bypasses the request pipeline; other controllers and subrequests are unaffected.
 
 ## Set the path
 
-Set `HEALTHCHECK_PATH` in your application's `.env` file or process environment before the route cache is built:
+Set `HEALTHCHECK_PATH` in your application's `.env` file or process environment before the application container is compiled:
 
 ```dotenv
 HEALTHCHECK_PATH=/internal/healthcheck
 ```
 
-The route keeps the `monsieurbiz_healthcheck` name and `GET`/`HEAD` methods. It does not add a response header.
+The path is compared exactly against `rawurldecode($request->getPathInfo())`. `getPathInfo()` excludes the request base URL and query string. The configured value is normalized once by Symfony's `Route` path handling, then used by both the listener and the optional named route; it is not localized or prefixed.
 
 ```bash
 curl -i https://example.test/internal/healthcheck
 curl -I https://example.test/internal/healthcheck
 ```
 
-The route loader reads `$_ENV`, then `$_SERVER`, then `getenv()`. An absent, empty, or non-string value uses `/healthcheck`; a higher-priority blank value therefore does not fall through to a lower-priority source. This native read happens while PHP routes load because Symfony does not accept `%env()%` in a route path.
+The extension reads the first present source at container compilation: `$_ENV`, then `$_SERVER`, then `getenv()`. An absent, empty, null, or non-string value uses `/healthcheck`; a present blank or null value does not fall through. Symfony normalizes leading slashes through `Route::getPath()`. This avoids unsupported `%env()%` route paths.
 
-The route path is fixed when routes are loaded and cached. After changing the variable, rebuild the application cache in the same environment:
+The listener and optional route share this frozen compile-time path. Changing `HEALTHCHECK_PATH` after kernel boot—even before the router first loads—cannot create a different listener path. Rebuild the application container and route cache in the same environment after changing it:
 
 ```bash
 APP_ENV=prod APP_DEBUG=0 php bin/console cache:clear
